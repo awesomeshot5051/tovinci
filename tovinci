@@ -1,0 +1,1449 @@
+#!/usr/bin/env python3
+"""tovinci: convert media into DaVinci Resolve (Linux) friendly formats.
+
+Videos become DNxHR (HQ for 8-bit sources, HQX for high bit-depth sources) in a
+.mov with uncompressed PCM audio, audio-only files become WAV, and images become
+high-quality JPEG. With -t, videos can instead become a much smaller H.264/AAC
+.mp4 (mp4, mp4-small) or ProRes in a .mov (prores, prores-422, prores-lt,
+prores-proxy). Several clips can be combined into one output in a single
+pass (-c), audio tracks can be mixed (-ca) or written as separate WAVs (-sa),
+and long jobs can be resumed after an interruption (-r). A dry run (-n) estimates
+the output size without writing any output files, and -o sends the results to a
+directory of your choice.
+
+Changelog:
+  2.5.0  Added -o/--output-dir: write every output file into a chosen directory
+         (created if missing). Batch runs refuse to start if two inputs would collide
+         on the same output name. The dry run checks free space at that location.
+  2.4.0  Added -n/--dry-run: estimates the final output size (per clip and total) by
+         encoding a few short samples, without creating any output files.
+  2.3.0  Restored the -t video types: mp4, mp4-small, prores, prores-hq, prores-422,
+         prores-lt, prores-proxy (they had been lost from the Python rewrite).
+  2.2.0  Added --version / -V.
+  2.1.0  Clips are combined in natural order (1, 2, ... 10); added --keep-order.
+  2.0.0  Rewritten in Python (was a bash script, 1.x); added -r/--resumable
+         with --restart, --keep-work and --work-dir; ffmpeg always runs with -nostdin.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "2.5.0"
+RUN_MARKER = "=== RUN START"
+AUTO_THREAD_BYTES = 10 * 1024 * 1024 * 1024  # 10GB auto-threading threshold
+FORBIDDEN_CACHE_ROOT = "/mnt/Data"  # resume data must never live on the secondary drive
+RULE = "-" * 56
+
+DRY_RUN_WINDOWS = 3        # number of sample windows taken per clip
+DRY_RUN_SECONDS = 4.0      # length of each sample window in seconds
+
+MP4_CRF = "18"        # visually near-lossless
+MP4_CRF_SMALL = "23"  # noticeably smaller, still good quality
+MP4_AUDIO_BITRATE = "192k"
+# ProRes profile name -> (prores_ks profile number, display label)
+PRORES_PROFILES = {
+    "proxy": ("0", "ProRes 422 Proxy"),
+    "lt": ("1", "ProRes 422 LT"),
+    "422": ("2", "ProRes 422"),
+    "hq": ("3", "ProRes 422 HQ"),
+}
+TYPE_CHOICES = ("wav, wav-16, wav-24, wav-32, mp4, mp4-small, prores, prores-hq, "
+                "prores-422, prores-lt, prores-proxy")
+
+VIDEO_EXTS = {"mov", "mp4", "mkv", "avi", "webm", "m4v", "mpg", "mpeg", "ts", "mts",
+              "m2ts", "wmv", "flv", "mxf", "ogv", "3gp"}
+AUDIO_EXTS = {"mp3", "wav", "flac", "aac", "m4a", "ogg", "opus", "wma", "aif", "aiff"}
+IMAGE_EXTS = {"jpg", "jpeg", "png", "bmp", "gif", "tif", "tiff", "webp", "heic", "heif",
+              "exr", "dpx", "psd", "tga", "jp2"}
+MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS
+
+EXAMPLES = """\
+examples:
+  tovinci clip.mov
+  tovinci -v *.png                 step log + brief ffmpeg progress
+  tovinci -vv *.png                full raw ffmpeg output, streamed live
+  tovinci -t wav song.mp3          force audio-only, ignore embedded art/video
+  tovinci -t wav-16 song.flac      force audio-only AND 16-bit PCM
+  tovinci -t mp4 clip.mov          small H.264/AAC .mp4 instead of DNxHR
+  tovinci -t mp4-small clip.mov    even smaller .mp4 (lower quality)
+  tovinci -t prores clip.mov       ProRes 422 HQ in a .mov
+  tovinci -t prores-lt clip.mov    smaller ProRes (422 LT)
+  tovinci --bits 16 clip.mov       normal conversion, but force 16-bit PCM audio
+  tovinci --threaded huge.mov      force multi-threaded encoding regardless of size
+  tovinci -j 4 *.mov               process up to 4 files concurrently
+  tovinci --use-gpu=true clip.mov  decode on GPU (NVDEC/VAAPI/QSV) if available
+  tovinci -ca clip.mov             mix all audio tracks into one stereo track
+  tovinci -sa clip.mov             video-only .mov plus one WAV per audio track
+  tovinci -c Name a.mov b.mov      combine, then convert -> Name.mov
+  tovinci -c Name -t mp4 a.mov b.mov          combine, then convert -> Name.mp4 (name goes right after -c)
+  tovinci -c a.mov b.mov           combine, then convert -> a_combined.mov
+  tovinci -c --keep-order Name b.mov a.mov    combine in exactly the order given
+  tovinci -c Name --no-convert a.mov b.mov    combine only, no conversion
+  tovinci -r -c -sa Name a.mov b.mov          resumable combine (re-run the same command to resume)
+  tovinci -n -c Name a.mov b.mov              dry run: estimate the combined size, write nothing
+  tovinci -n -t mp4 *.mov                     dry run: estimate each file's size as mp4
+  tovinci -o /path/to/out *.mov               write every converted file into /path/to/out
+  tovinci -c Name -o /path/to/out a.mov b.mov combine -> /path/to/out/Name.mov
+
+types (-t):
+  wav, wav-16, wav-24, wav-32     audio-only WAV (the number forces the PCM bit depth)
+  mp4                             H.264 (CRF 18) + AAC 192k in .mp4, much smaller than DNxHR
+  mp4-small                       H.264 (CRF 23) + AAC 192k in .mp4, smaller still
+  prores, prores-hq               ProRes 422 HQ in .mov with PCM audio
+  prores-422                      ProRes 422
+  prores-lt                       ProRes 422 LT
+  prores-proxy                    ProRes 422 Proxy
+  Images still become JPEG and audio-only files still become WAV with the video types.
+  Note: the free DaVinci Resolve on Linux may not decode H.264/AAC mp4 files.
+
+PCM audio bit depth defaults to each source track's depth (lossy sources such as AAC become 16-bit).
+mp4 types use AAC audio, so --bits does not apply to them.
+
+clip order (-c):
+  Clips are combined in natural order (1, 2, ... 9, 10), not plain text order (1, 10, 2, ...),
+  so a shell glob like "Clip "*".mov" comes out right. If a different order was received, a note
+  says so. Use --keep-order to combine in exactly the order given.
+
+resume (-r):
+  Combine mode encodes one clip at a time into a work directory, then joins the finished
+  clips with a fast stream copy. If the run is interrupted, re-running the identical
+  command skips every clip that already finished. Batch mode skips files that already
+  finished. A clip that was mid-encode when interrupted is redone from its start.
+  The work directory defaults to ~/.cache/tovinci and may never be under /mnt/Data.
+  Peak disk use is roughly twice the final output (the parts plus the joined file).
+
+dry run (-n):
+  Nothing is written to the output location. For each clip, a few short sample windows are
+  encoded with the exact settings a real run would use (into a temporary folder inside the
+  work directory, deleted afterward), the size per second is measured, and that is scaled to
+  the clip's full duration. DNxHR is close to constant bitrate, so its estimate is tight;
+  mp4 and ProRes vary with content, so treat those as a ballpark. Combine with -c to see the
+  size of the combined file, and with -t to compare formats. Free disk space is reported too.
+
+output location (-o):
+  -o DIR puts every output file (the converted video, JPEG or WAV, split audio WAVs, and the
+  combined file) in DIR, which is created if it does not exist. Without -o, outputs go in the
+  current directory as before. The in-progress .partial files used by -r live in DIR as well,
+  so the final rename is instant. Resume data and dry-run samples stay in the work directory
+  (default ~/.cache/tovinci), not in DIR. In a batch, two inputs that would produce the same
+  output name (same file name in different folders) are refused, so nothing is overwritten.
+"""
+
+
+class ToolError(Exception):
+    """A user-facing error: printed without a traceback."""
+
+
+@dataclass
+class Options:
+    verbose: int = 0
+    target_type: str = ""
+    quality: str = ""
+    bits: str | None = None
+    threaded: bool = False
+    jobs: int = 1
+    gpu_requested: bool = False
+    combine: bool = False
+    combine_name: str = ""
+    no_convert: bool = False
+    combine_audio: bool = False
+    split_audio: bool = False
+    resumable: bool = False
+    keep_order: bool = False
+    restart: bool = False
+    keep_work: bool = False
+    work_dir: Path | None = None
+    dry_run: bool = False
+    output_dir: Path | None = None
+
+
+@dataclass
+class Gpu:
+    backend: str = ""
+    device: str = ""
+
+
+@dataclass
+class Plan:
+    pre: list
+    inp: list
+    outputs: list  # list of (output_args, output_path); the first is the main output
+
+
+# ---------------------------------------------------------------- logging ---
+
+class Logger:
+    _lock = threading.Lock()
+
+    def __init__(self, path: Path, verbose: int, prefix: str = ""):
+        self.path = path
+        self.verbose = verbose
+        self.prefix = prefix
+
+    def child(self, prefix: str) -> "Logger":
+        return Logger(self.path, self.verbose, prefix)
+
+    def _emit(self, msg: str, to_terminal: bool) -> None:
+        line = f"{self.prefix}{msg}"
+        with Logger._lock:
+            try:
+                with open(self.path, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
+            if to_terminal:
+                print(line, flush=True)
+
+    def log(self, msg: str) -> None:
+        self._emit(msg, self.verbose >= 1)
+
+    def notify(self, msg: str) -> None:
+        self._emit(msg, True)
+
+    def append_raw(self, lines: list) -> None:
+        with Logger._lock:
+            try:
+                with open(self.path, "a", encoding="utf-8") as fh:
+                    for ln in lines:
+                        fh.write(ln + "\n")
+            except OSError:
+                pass
+
+
+def setup_log_path() -> Path:
+    primary = Path(os.environ.get("HOME") or "/tmp") / "tovinci.log"
+    try:
+        primary.touch()
+        return primary
+    except OSError:
+        fallback = Path("/tmp/tovinci.log")
+        print(f"Warning: could not write to '{primary}', logging to '{fallback}' instead.",
+              file=sys.stderr)
+        try:
+            fallback.touch()
+        except OSError:
+            pass
+        return fallback
+
+
+def rotate_log(path: Path) -> None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if sum(1 for ln in text.splitlines() if ln.startswith(RUN_MARKER)) >= 3:
+        try:
+            path.unlink()
+            path.touch()
+        except OSError:
+            pass
+
+
+def tail_log(path: Path, n: int = 10) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[-n:])
+
+
+# ---------------------------------------------------------- small helpers ---
+
+def ext_of(name: str) -> str:
+    return os.path.splitext(name)[1].lstrip(".").lower()
+
+
+def has_media_ext(arg: str) -> bool:
+    return "." in arg and ext_of(arg) in MEDIA_EXTS
+
+
+def is_image_ext(arg: str) -> bool:
+    return ext_of(arg) in IMAGE_EXTS
+
+
+def has_glob_chars(arg: str) -> bool:
+    return any(c in arg for c in "*?[")
+
+
+def looks_like_name(arg: str) -> bool:
+    """True if the argument after -c is the optional output name, not an input."""
+    if arg.startswith("-"):
+        return False
+    if os.path.isfile(arg):
+        return False
+    if has_glob_chars(arg):
+        return False
+    if has_media_ext(arg):
+        return False
+    return True
+
+
+def get_file_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def temp_name(path: str) -> str:
+    root, ext = os.path.splitext(path)
+    return f"{root}.partial{ext}"
+
+
+def natural_key(path: str) -> tuple:
+    """Sort key that orders numbers by value (clip 2 before clip 10)."""
+    parts = re.split(r"(\d+)", path)
+    return ([int(p) if i % 2 else p.casefold() for i, p in enumerate(parts)], path)
+
+
+def order_for_combine(files: list, opts: Options, logger: "Logger") -> list:
+    """Natural-sort the clips unless --keep-order was given. Shell globs sort as
+    plain text (1, 10, 2, ...), which would put clip 10 right after clip 1."""
+    if opts.keep_order:
+        return files
+    ordered = sorted(files, key=natural_key)
+    if ordered != files:
+        logger.notify("Note: clips were reordered into natural order (1, 2, ... 10) instead of the order "
+                      "received. Use --keep-order to combine in exactly the order given.")
+    return ordered
+
+
+def discard(paths: list) -> None:
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def quote_for_concat(path: str) -> str:
+    return path.replace("'", "'\\''")
+
+
+def video_ext(opts: Options) -> str:
+    """Container extension for converted video output."""
+    return "mp4" if opts.target_type == "mp4" else "mov"
+
+
+def human_size(num: float) -> str:
+    """Bytes as a short human-readable string (binary units)."""
+    value = float(num)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(value) < 1024 or unit == "TiB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{value:.2f} TiB"
+
+
+def human_duration(seconds: float) -> str:
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}"
+
+
+# ------------------------------------------------------- output location ---
+
+def out_stem(name: str, opts: Options) -> str:
+    """Place an output stem (no extension) inside the output directory, if one was given."""
+    if opts.output_dir is None:
+        return name
+    return str(opts.output_dir / name)
+
+
+def default_stem(input_file: str, opts: Options) -> str:
+    """Default output stem for a single converted file: <name>_davinci in the output location."""
+    return out_stem(f"{os.path.splitext(os.path.basename(input_file))[0]}_davinci", opts)
+
+
+def existing_parent(path: Path) -> Path:
+    """Nearest parent of path that exists (used for free-space checks on a directory
+    that has not been created yet)."""
+    p = path.absolute()
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return p
+
+
+def prepare_output_dir(opts: Options) -> None:
+    """Create the output directory if needed and make sure it can be written to."""
+    d = opts.output_dir
+    if d is None:
+        return
+    if d.exists() and not d.is_dir():
+        raise ToolError(f"--output-dir '{d}' exists but is not a directory.")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ToolError(f"could not create output directory '{d}': {exc}")
+    if not os.access(d, os.W_OK):
+        raise ToolError(f"output directory '{d}' is not writable.")
+
+
+def check_output_collisions(files: list, opts: Options) -> None:
+    """With a shared output directory, two inputs with the same file name from different
+    folders would overwrite each other. Refuse before encoding anything."""
+    if opts.output_dir is None:
+        return
+    seen: dict = {}
+    for f in files:
+        key = (os.path.splitext(os.path.basename(f))[0], "image" if is_image_ext(f) else "av")
+        if key in seen and os.path.abspath(seen[key]) != os.path.abspath(f):
+            raise ToolError(f"'{seen[key]}' and '{f}' would both write to the same output name in "
+                            f"'{opts.output_dir}'. Convert them separately or rename one.")
+        seen.setdefault(key, f)
+
+
+# ----------------------------------------------------------------- probing ---
+
+def ffprobe(*args: str) -> str:
+    try:
+        res = subprocess.run(["ffprobe", "-v", "error", *args],
+                             capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise ToolError("ffprobe was not found in PATH.")
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def probe_value(path: str, stream: str, entries: str) -> str:
+    return ffprobe("-select_streams", stream, "-show_entries", f"stream={entries}",
+                   "-of", "default=nk=1:nw=1", path)
+
+
+def probe_duration(path: str) -> float:
+    """Container duration in seconds, or 0.0 if it cannot be read."""
+    out = ffprobe("-show_entries", "format=duration", "-of", "default=nk=1:nw=1", path)
+    try:
+        return max(float(out), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def count_audio(path: str) -> int:
+    out = ffprobe("-select_streams", "a", "-show_entries", "stream=index",
+                  "-of", "csv=p=0", path)
+    return len([ln for ln in out.splitlines() if ln.strip()])
+
+
+def stream_signature(path: str) -> str:
+    video = ffprobe("-select_streams", "v:0", "-show_entries",
+                    "stream=codec_name,width,height,pix_fmt,r_frame_rate", "-of", "csv=p=0", path)
+    audio = ffprobe("-select_streams", "a", "-show_entries",
+                    "stream=codec_name,sample_rate,channels", "-of", "csv=p=0", path)
+    return video + "\n" + audio
+
+
+def pcm_codec_for_track(path: str, idx: int, bits_override: str | None) -> str:
+    """PCM codec for audio track idx: forced depth wins, else match the source.
+
+    Lossy sources (AAC, MP3, Opus, Vorbis...) decode to float and map to 16-bit.
+    """
+    if bits_override:
+        return f"pcm_s{bits_override}le"
+
+    info = {}
+    out = ffprobe("-select_streams", f"a:{idx}", "-show_entries",
+                  "stream=codec_name,sample_fmt,bits_per_raw_sample",
+                  "-of", "default=noprint_wrappers=1", path)
+    for line in out.splitlines():
+        if "=" in line:
+            key, val = line.split("=", 1)
+            info[key] = val
+    codec = info.get("codec_name", "")
+    fmt = info.get("sample_fmt", "")
+    raw = info.get("bits_per_raw_sample", "")
+
+    if raw.isdigit() and int(raw) > 0:
+        raw_bits = int(raw)
+        bits = 16 if raw_bits <= 16 else 24 if raw_bits <= 24 else 32
+    elif fmt in ("u8", "u8p", "s16", "s16p"):
+        bits = 16
+    elif fmt in ("s32", "s32p"):
+        bits = 32
+    elif fmt in ("flt", "fltp", "dbl", "dblp"):
+        bits = 32 if codec.startswith("pcm_f") else 16
+    else:
+        bits = 16
+    return f"pcm_s{bits}le"
+
+
+# ------------------------------------------------------------- audio args ---
+
+def set_audio_codec_args(kind: str, path: str, audio_count: int, opts: Options, log) -> list:
+    """Codec args matching the source depth per track (or the forced depth).
+
+    mp4 video output uses AAC instead, since PCM does not belong in an mp4.
+    """
+    if kind == "video" and opts.target_type == "mp4":
+        args = ["-c:a", "aac", "-b:a", MP4_AUDIO_BITRATE]
+        log(f"mp4 output uses AAC audio at {MP4_AUDIO_BITRATE}: {' '.join(args)}")
+        return args
+
+    if kind == "video" and audio_count > 1 and not opts.combine_audio:
+        args = []
+        for i in range(audio_count):
+            args += [f"-c:a:{i}", pcm_codec_for_track(path, i, opts.bits)]
+    else:
+        args = ["-c:a", pcm_codec_for_track(path, 0, opts.bits)]
+
+    if opts.bits:
+        log(f"Audio bit depth forced to {opts.bits}-bit: {' '.join(args)}")
+    else:
+        log(f"Audio bit depth matched to source: {' '.join(args)}")
+    return args
+
+
+def build_audio_args(kind: str, path: str, audio_count: int, opts: Options, log) -> list:
+    """Audio stream selection. Default keeps tracks separate, -ca mixes them."""
+    if audio_count > 1:
+        if opts.combine_audio:
+            filt = "".join(f"[0:a:{i}]" for i in range(audio_count))
+            # normalize=0 keeps each track at its original level.
+            filt += f"amix=inputs={audio_count}:duration=longest:normalize=0[aout]"
+            log(f"Combine-audio enabled. Mixing {audio_count} audio tracks into one stereo track.")
+            return ["-filter_complex", filt, "-map", "[aout]", "-ac", "2"]
+        if kind == "video":
+            log(f"{audio_count} audio tracks detected. Keeping them as separate tracks (use -ca to mix them into one).")
+            return ["-map", "0:a"]
+        print(f"Warning: '{path}' has {audio_count} audio tracks but WAV output holds only one. "
+              "Using the first track (use -ca to mix them all, or -sa to write one WAV per track).",
+              file=sys.stderr)
+        log(f"Audio-only output holds a single stream. Using the first of {audio_count} audio tracks.")
+        return ["-map", "0:a:0"]
+
+    args = ["-map", "0:a:0"]
+    if opts.combine_audio:
+        channels = ffprobe("-select_streams", "a:0", "-show_entries", "stream=channels",
+                           "-of", "default=nk=1:nw=1", path)
+        if channels.isdigit() and int(channels) > 2:
+            log(f"Combine-audio enabled. Downmixing {channels} channels to stereo.")
+            args += ["-ac", "2"]
+        else:
+            log(f"Combine-audio enabled, but there is only one audio track with {channels} channel(s). Nothing to mix.")
+    return args
+
+
+def build_split_outputs(start: int, stem: str, path: str, audio_count: int,
+                        opts: Options, log) -> list:
+    """One extra WAV output per audio track, named <stem>_a1.wav, <stem>_a2.wav, ..."""
+    outputs = []
+    for i in range(start, audio_count):
+        wav = f"{stem}_a{i + 1}.wav"
+        codec = pcm_codec_for_track(path, i, opts.bits)
+        log(f"Split track {i + 1} -> '{wav}' ({codec})")
+        outputs.append((["-map", f"0:a:{i}", "-c:a", codec], wav))
+    return outputs
+
+
+# ------------------------------------------------------------------- GPU ---
+
+def detect_gpu() -> Gpu | None:
+    """Pick a usable GPU decode backend. ffmpeg has no GPU DNxHR encoder, so this
+    only speeds up decoding the source; the encode stays on the CPU."""
+    try:
+        res = subprocess.run(["ffmpeg", "-hide_banner", "-hwaccels"], capture_output=True,
+                             text=True, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return None
+    available = {ln.strip() for ln in res.stdout.splitlines()[1:]}
+    render_node = "/dev/dri/renderD128"
+    if "cuda" in available and shutil.which("nvidia-smi"):
+        return Gpu("cuda")
+    if "vaapi" in available and os.path.exists(render_node):
+        return Gpu("vaapi", render_node)
+    if "qsv" in available and os.path.exists(render_node):
+        return Gpu("qsv")
+    return None
+
+
+# -------------------------------------------------------------- planning ---
+
+def build_plan(input_file: str, stem: str | None, opts: Options, gpu: Gpu | None, log,
+               concat_list: str | None = None, size_override: int | None = None) -> Plan:
+    """Probe input_file and work out the ffmpeg arguments and output files."""
+    log(f"Analyzing '{input_file}'...")
+
+    if stem is None:
+        stem = default_stem(input_file, opts)
+
+    pre: list = []
+    if concat_list:
+        log(f"Combined input: stream settings are probed from '{input_file}', clips are read via concat list.")
+        inp = ["-f", "concat", "-safe", "0", "-i", concat_list]
+    else:
+        inp = ["-i", input_file]
+
+    is_image = ext_of(input_file) in IMAGE_EXTS
+    file_size = size_override if size_override is not None else get_file_size(input_file)
+    use_threads = opts.threaded or file_size >= AUTO_THREAD_BYTES
+    thread_count = os.cpu_count() or 1
+    audio_count = 0 if is_image else count_audio(input_file)
+
+    if is_image:
+        log("Image file detected. Automagically configuring for DaVinci Resolve image compatibility...")
+        log("Converting to high-quality JPEG...")
+        # Single-frame encode: threading does not help here.
+        return Plan(pre, inp, [(["-pix_fmt", "yuvj420p", "-q:v", "2", "-update", "1"], f"{stem}.jpg")])
+
+    if opts.target_type == "wav":
+        # Explicit audio-only: ignore any video stream (e.g. cover art in an mp3).
+        if probe_value(input_file, "a:0", "codec_type") != "audio":
+            raise ToolError(f"-t wav specified but no audio stream found in '{input_file}'.")
+        log("Forced audio-only mode (-t wav). Automagically configuring for DaVinci Resolve Linux audio compatibility...")
+        return Plan(pre, inp, audio_only_outputs(input_file, stem, audio_count, opts, log, drop_video=True))
+
+    has_video = probe_value(input_file, "v:0", "codec_type")
+    has_audio = probe_value(input_file, "a:0", "codec_type")
+
+    if not has_video and has_audio == "audio":
+        if opts.target_type in ("mp4", "prores"):
+            log(f"No video stream in '{input_file}', so the -t {opts.target_type} video type does not apply. Writing WAV instead.")
+        log("Sole audio file detected. Automagically configuring for DaVinci Resolve Linux audio compatibility...")
+        return Plan(pre, inp, audio_only_outputs(input_file, stem, audio_count, opts, log, drop_video=False))
+
+    pix_fmt = probe_value(input_file, "v:0", "pix_fmt")
+    log(f"Detected source pixel format: {pix_fmt}")
+
+    if opts.target_type == "mp4":
+        crf = MP4_CRF_SMALL if opts.quality == "small" else MP4_CRF
+        log(f"Transcoding to H.264 (CRF {crf}) in an mp4 container...")
+        args = ["-map", "0:v:0", "-c:v", "libx264", "-preset", "medium", "-crf", crf,
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    elif opts.target_type == "prores":
+        number, label = PRORES_PROFILES[opts.quality or "hq"]
+        log(f"Transcoding to {label} (10-bit 4:2:2) in a mov container...")
+        args = ["-map", "0:v:0", "-c:v", "prores_ks", "-profile:v", number, "-vendor", "apl0",
+                "-pix_fmt", "yuv422p10le"]
+    elif "10" in pix_fmt or "12" in pix_fmt or "le" in pix_fmt:
+        log("High bit-depth detected. Transcoding to 10-bit DNxHR HQX...")
+        args = ["-map", "0:v:0", "-c:v", "dnxhd", "-profile:v", "dnxhr_hqx", "-pix_fmt", "yuv422p10le"]
+    else:
+        log("Standard bit-depth detected. Transcoding to 8-bit DNxHR HQ...")
+        args = ["-map", "0:v:0", "-c:v", "dnxhd", "-profile:v", "dnxhr_hq", "-pix_fmt", "yuv422p"]
+
+    if use_threads:
+        if opts.threaded:
+            log(f"Threaded mode forced (--threaded). Using {thread_count} encoder threads.")
+        else:
+            log(f"File size ({file_size} bytes) exceeds 10GB threshold. Automagically enabling {thread_count} encoder threads...")
+        args += ["-threads", str(thread_count)]
+
+    if gpu is not None:
+        log(f"Using GPU-accelerated ({gpu.backend}) decode for the source file. Encode + threading above still run on CPU.")
+        if gpu.backend == "cuda":
+            pre = ["-hwaccel", "cuda"]
+        elif gpu.backend == "vaapi":
+            pre = ["-vaapi_device", gpu.device, "-hwaccel", "vaapi"]
+        elif gpu.backend == "qsv":
+            pre = ["-hwaccel", "qsv"]
+
+    extras: list = []
+    if has_audio == "audio":
+        if opts.split_audio and audio_count > 1:
+            log(f"Split-audio enabled. Video-only .{video_ext(opts)} plus one WAV per audio track ({audio_count} tracks).")
+            args.append("-an")
+            extras = build_split_outputs(0, stem, input_file, audio_count, opts, log)
+        else:
+            if opts.target_type == "mp4":
+                log("Audio stream detected. Encoding it as AAC.")
+            else:
+                log("Audio stream detected. Retaining uncompressed audio.")
+            sel = build_audio_args("video", input_file, audio_count, opts, log)
+            codec = set_audio_codec_args("video", input_file, audio_count, opts, log)
+            args += sel + codec
+    else:
+        log("No audio stream detected. Stripping audio track.")
+        args.append("-an")
+
+    return Plan(pre, inp, [(args, f"{stem}.{video_ext(opts)}")] + extras)
+
+
+def audio_only_outputs(input_file: str, stem: str, audio_count: int, opts: Options, log,
+                       drop_video: bool) -> list:
+    """Outputs for audio-only conversion. -vn drops attached pictures that the WAV muxer rejects."""
+    vn = ["-vn"] if drop_video else []
+    codec = set_audio_codec_args("audio", input_file, audio_count, opts, log)
+    if opts.split_audio and audio_count > 1:
+        log(f"Split-audio enabled. Writing each of the {audio_count} audio tracks as its own WAV.")
+        main = (vn + ["-map", "0:a:0"] + codec, f"{stem}_a1.wav")
+        return [main] + build_split_outputs(1, stem, input_file, audio_count, opts, log)
+    sel = build_audio_args("audio", input_file, audio_count, opts, log)
+    return [(vn + sel + codec, f"{stem}.wav")]
+
+
+# ------------------------------------------------------------- execution ---
+
+def run_ffmpeg(args: list, opts: Options, logger: Logger) -> int:
+    """Run ffmpeg honoring -v/-vv. -nostdin stops stray keypresses from reaching ffmpeg."""
+    base = ["ffmpeg", "-y", "-nostdin"]
+    if opts.verbose >= 2:
+        pass  # full live output
+    elif opts.verbose == 1:
+        # -stats is explicit because ffmpeg hides live progress when output is piped.
+        base += ["-hide_banner", "-loglevel", "error", "-stats"]
+    else:
+        base += ["-loglevel", "error"]
+    cmd = base + args
+
+    try:
+        if opts.verbose == 0:
+            with open(logger.path, "a", encoding="utf-8") as fh:
+                return subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=fh,
+                                      stderr=subprocess.STDOUT).returncode
+
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, bufsize=0)
+    except FileNotFoundError:
+        raise ToolError("ffmpeg was not found in PATH.")
+
+    fd = proc.stdout.fileno()
+    buf = ""
+    try:
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            text = chunk.decode("utf-8", "replace")
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            buf += text
+            *lines, buf = buf.split("\n")
+            # Progress updates use \r; the log keeps only the last one per line.
+            logger.append_raw([ln.rsplit("\r", 1)[-1] for ln in lines])
+        if buf:
+            logger.append_raw([buf.rsplit("\r", 1)[-1]])
+        return proc.wait()
+    except BaseException:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise
+
+
+def encode(plan: Plan, opts: Options, logger: Logger, label: str, use_temp: bool) -> int:
+    """Run one ffmpeg pass for a plan. With use_temp, outputs are written as
+    <name>.partial<ext> and only renamed once ffmpeg succeeds, so an interrupted
+    run never leaves something that looks finished."""
+    finals = [p for _, p in plan.outputs]
+    targets = [temp_name(p) for p in finals] if use_temp else finals
+
+    def assemble(pre: list) -> list:
+        args = list(pre) + list(plan.inp)
+        for (oargs, _), target in zip(plan.outputs, targets):
+            args += list(oargs) + [target]
+        return args
+
+    logger.log("Running FFmpeg command...")
+    logger.log(shlex.join(["ffmpeg"] + assemble(plan.pre)))
+    logger.log(RULE)
+
+    try:
+        status = run_ffmpeg(assemble(plan.pre), opts, logger)
+        if status != 0 and plan.pre:
+            # GPU decode failed (unsupported codec, driver issue...). Retry once on CPU.
+            logger.log(f"GPU-accelerated decode failed (exit code {status}) for '{label}'. Retrying with CPU decode...")
+            status = run_ffmpeg(assemble([]), opts, logger)
+    except BaseException:
+        if use_temp:
+            discard(targets)
+        raise
+
+    if status != 0:
+        if use_temp:
+            discard(targets)
+        print(f"Error: ffmpeg failed (exit code {status}) while processing '{label}'.", file=sys.stderr)
+        if opts.verbose < 2:
+            print("Last few lines of ffmpeg output:", file=sys.stderr)
+            print(tail_log(logger.path), file=sys.stderr)
+        print(f"Full details: {logger.path}", file=sys.stderr)
+        return status
+
+    logger.log(RULE)
+    if use_temp:
+        for tmp, final in zip(targets, finals):
+            os.replace(tmp, final)
+    return 0
+
+
+def announce_outputs(plan: Plan, logger: Logger) -> None:
+    logger.notify(f"Done! Highly compatible file created: '{plan.outputs[0][1]}'")
+    for _, path in plan.outputs[1:]:
+        logger.notify(f"Done! Separate audio track created: '{path}'")
+
+
+# ----------------------------------------------------------- resume state ---
+
+def job_key(inputs: list, stem: str, opts: Options) -> str:
+    items = []
+    for f in inputs:
+        st = os.stat(f)
+        items.append([os.path.abspath(f), st.st_size, st.st_mtime_ns])
+    payload = json.dumps({
+        "inputs": items,
+        "stem": os.path.abspath(stem),
+        "opts": {"bits": opts.bits, "ca": opts.combine_audio, "sa": opts.split_audio,
+                 "t": opts.target_type, "q": opts.quality, "nc": opts.no_convert},
+        "v": 1,
+    }, sort_keys=True)
+    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+
+
+def state_root(opts: Options) -> Path:
+    """Directory for resume data. Never allowed under /mnt/Data."""
+    if opts.work_dir is not None:
+        root = opts.work_dir.expanduser()
+    else:
+        base = os.environ.get("XDG_CACHE_HOME")
+        root = (Path(base) if base else Path.home() / ".cache") / "tovinci"
+    real = os.path.realpath(root)
+    if real == FORBIDDEN_CACHE_ROOT or real.startswith(FORBIDDEN_CACHE_ROOT + os.sep):
+        raise ToolError(f"resume data must not live under {FORBIDDEN_CACHE_ROOT} (got '{root}'). "
+                        "Use --work-dir to pick a location on the primary drive.")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ToolError(f"could not create work directory '{root}': {exc}")
+    return root
+
+
+def note_work_dir(root: Path, logger: Logger) -> None:
+    try:
+        free = shutil.disk_usage(root).free / (1024 ** 3)
+        logger.notify(f"Resume data: {root} ({free:.0f} GiB free). Peak use is about twice the final output.")
+    except OSError:
+        logger.notify(f"Resume data: {root}")
+
+
+# --------------------------------------------------------------- dry run ---
+
+def encode_sample(plan: Plan, pos: float | None, length: float | None, opts: Options,
+                  logger: Logger, tmp: str, tag: str) -> int | None:
+    """Encode one short window of a clip with the plan's exact settings and return the
+    total bytes written across all of the plan's outputs (None on failure). The sample
+    files go into tmp and are deleted right away."""
+    targets = []
+    for j, (_, final) in enumerate(plan.outputs):
+        targets.append(os.path.join(tmp, f"{tag}_{j}{os.path.splitext(final)[1]}"))
+
+    def assemble(pre: list) -> list:
+        args = list(pre)
+        if pos is not None:
+            args += ["-ss", f"{pos:.3f}"]
+        args += list(plan.inp)
+        for (oargs, _), target in zip(plan.outputs, targets):
+            if length is not None:
+                args += ["-t", f"{length:.3f}"]
+            args += list(oargs) + [target]
+        return args
+
+    logger.log(shlex.join(["ffmpeg"] + assemble(plan.pre)))
+    try:
+        status = run_ffmpeg(assemble(plan.pre), opts, logger)
+        if status != 0 and plan.pre:
+            logger.log(f"GPU-accelerated decode failed (exit code {status}) during sampling. Retrying with CPU decode...")
+            status = run_ffmpeg(assemble([]), opts, logger)
+    except BaseException:
+        discard(targets)
+        raise
+
+    size = sum(get_file_size(t) for t in targets) if status == 0 else None
+    discard(targets)
+    return size
+
+
+def sample_positions(duration: float) -> list | None:
+    """Start times for the sample windows, or None if the clip is short enough to
+    just encode in full (which makes its estimate exact)."""
+    if duration <= DRY_RUN_WINDOWS * DRY_RUN_SECONDS * 2:
+        return None
+    span = duration - DRY_RUN_SECONDS
+    if DRY_RUN_WINDOWS == 1:
+        return [span / 2]
+    return [span * i / (DRY_RUN_WINDOWS - 1) for i in range(DRY_RUN_WINDOWS)]
+
+
+def estimate_clip(clip: str, opts: Options, gpu: Gpu | None, logger: Logger, tmp: str,
+                  tag: str, size_override: int | None) -> dict:
+    """Estimate the output size for one clip. Returns a dict with keys: bytes (or None),
+    duration, exact (bool) and note (str)."""
+    plan = build_plan(clip, "sample", opts, gpu, logger.log, size_override=size_override)
+
+    if is_image_ext(clip):
+        size = encode_sample(plan, None, None, opts, logger, tmp, tag)
+        return {"bytes": size, "duration": 0.0, "exact": True,
+                "note": "" if size is not None else "image conversion failed"}
+
+    duration = probe_duration(clip)
+    if duration <= 0:
+        return {"bytes": None, "duration": 0.0, "exact": False,
+                "note": "could not read the duration"}
+
+    positions = sample_positions(duration)
+    if positions is None:
+        size = encode_sample(plan, None, None, opts, logger, tmp, tag)
+        return {"bytes": size, "duration": duration, "exact": True,
+                "note": "" if size is not None else "sample encode failed"}
+
+    total_bytes = 0
+    total_secs = 0.0
+    for n, pos in enumerate(positions):
+        size = encode_sample(plan, pos, DRY_RUN_SECONDS, opts, logger, tmp, f"{tag}_{n}")
+        if size is None:
+            return {"bytes": None, "duration": duration, "exact": False,
+                    "note": "sample encode failed"}
+        total_bytes += size
+        total_secs += DRY_RUN_SECONDS
+    return {"bytes": total_bytes / total_secs * duration, "duration": duration,
+            "exact": False, "note": ""}
+
+
+def run_dry_run(files: list, opts: Options, gpu: Gpu | None, logger: Logger, combine: bool) -> int:
+    """Estimate output sizes without writing any output files."""
+    count = len(files)
+    total_in = sum(get_file_size(f) for f in files)
+
+    if combine:
+        for f in files:
+            if is_image_ext(f):
+                print(f"Error: -c/--combine only supports video/audio files, but '{f}' is an image.", file=sys.stderr)
+                return 1
+        ref_sig = stream_signature(files[0])
+        for f in files[1:]:
+            if stream_signature(f) != ref_sig:
+                print(f"Warning: '{f}' does not match the stream layout of '{files[0]}'. A real combine "
+                      "would fail on this.", file=sys.stderr)
+
+    if combine and opts.no_convert:
+        logger.notify("Dry run (nothing is written): --no-convert is a stream copy, so the combined file "
+                      "will be about the size of the inputs.")
+        report_dry_run([(f, {"bytes": get_file_size(f), "duration": probe_duration(f),
+                             "exact": True, "note": ""}) for f in files], total_in, opts, combine)
+        return 0
+
+    logger.notify(f"Dry run (nothing is written): sampling {count} file(s), "
+                  f"{DRY_RUN_WINDOWS} x {DRY_RUN_SECONDS:.0f}s per clip...")
+
+    results: list = []
+    root = state_root(opts)  # sample files stay on the primary drive, never under /mnt/Data
+    size_override = total_in if combine else None
+    with tempfile.TemporaryDirectory(prefix="dryrun-", dir=str(root)) as tmp:
+        for idx, clip in enumerate(files):
+            logger.notify(f"[{idx + 1}/{count}] Sampling '{clip}'...")
+            try:
+                res = estimate_clip(clip, opts, gpu, logger, tmp, f"c{idx:04d}", size_override)
+            except ToolError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                res = {"bytes": None, "duration": 0.0, "exact": False, "note": str(exc)}
+            results.append((clip, res))
+
+    report_dry_run(results, total_in, opts, combine)
+    return 1 if any(r["bytes"] is None for _, r in results) else 0
+
+
+def report_dry_run(results: list, total_in: int, opts: Options, combine: bool) -> None:
+    print()
+    print("Dry run estimate (no output files were created)")
+    print(RULE)
+    est_total = 0.0
+    dur_total = 0.0
+    unknown = 0
+    all_exact = True
+    for clip, res in results:
+        name = os.path.basename(clip)
+        if res["bytes"] is None:
+            unknown += 1
+            print(f"  {name}: unknown ({res['note']})")
+            continue
+        est_total += res["bytes"]
+        dur_total += res["duration"]
+        all_exact = all_exact and res["exact"]
+        dur = human_duration(res["duration"]) if res["duration"] else "image"
+        tag = "exact" if res["exact"] else "est."
+        print(f"  {name}: {dur}  {human_size(res['bytes'])} ({tag})")
+    print(RULE)
+
+    if combine:
+        print(f"Combined output: about {human_size(est_total)} "
+              f"over {human_duration(dur_total)}")
+    else:
+        print(f"All outputs together: about {human_size(est_total)}")
+    if total_in:
+        ratio = est_total / total_in
+        print(f"Inputs total: {human_size(total_in)} (output is about {ratio:.1f}x the input size)")
+    if unknown:
+        print(f"Note: {unknown} file(s) could not be estimated and are not included in the total.")
+    if not all_exact:
+        print("Estimates come from short samples; DNxHR is close to constant bitrate, while mp4 and "
+              "ProRes vary with content.")
+
+    try:
+        target = opts.output_dir if opts.output_dir is not None else Path.cwd()
+        free = shutil.disk_usage(existing_parent(target)).free
+        where = f"'{opts.output_dir}'" if opts.output_dir is not None else "the current directory"
+        print(f"Free space at {where}: {human_size(free)}")
+        needed = est_total * 2 if (combine and opts.resumable and not opts.no_convert) else est_total
+        if opts.resumable and combine and not opts.no_convert:
+            print(f"With -r, peak disk use is about twice the output: roughly {human_size(needed)}.")
+        if needed > free:
+            print("Warning: this is more than the free space available there.")
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------ single file ---
+
+def process_file(path: str, opts: Options, gpu: Gpu | None, logger: Logger) -> int:
+    """Convert one file. With -r, a file that already finished is skipped."""
+    try:
+        plan = build_plan(path, None, opts, gpu, logger.log)
+    except ToolError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if not opts.resumable:
+        status = encode(plan, opts, logger, path, use_temp=False)
+        if status == 0:
+            announce_outputs(plan, logger)
+        return status
+
+    state = state_root(opts) / f"file-{job_key([path], plan.outputs[0][1], opts)}"
+    done = state / "done.json"
+    if opts.restart and state.exists():
+        shutil.rmtree(state, ignore_errors=True)
+    if done.exists() and all(os.path.exists(p) for _, p in plan.outputs):
+        logger.notify(f"Already converted, skipping: '{path}' (use --restart to redo it)")
+        return 0
+
+    status = encode(plan, opts, logger, path, use_temp=True)
+    if status == 0:
+        state.mkdir(parents=True, exist_ok=True)
+        done.write_text(json.dumps([p for _, p in plan.outputs]))
+        announce_outputs(plan, logger)
+    return status
+
+
+# ---------------------------------------------------------------- combine ---
+
+def abs_path(p: str) -> str:
+    return os.path.join(os.path.realpath(os.path.dirname(p) or "."), os.path.basename(p))
+
+
+def write_concat_list(list_path: Path, paths: list) -> None:
+    with open(list_path, "w", encoding="utf-8") as fh:
+        for p in paths:
+            fh.write(f"file '{quote_for_concat(abs_path(p))}'\n")
+
+
+def run_combine(files: list, opts: Options, gpu: Gpu | None, logger: Logger) -> int:
+    first = files[0]
+    first_name = os.path.basename(first)
+    first_ext = ext_of(first_name)
+
+    for f in files:
+        if is_image_ext(f):
+            print(f"Error: -c/--combine only supports video/audio files, but '{f}' is an image.", file=sys.stderr)
+            return 1
+
+    stem = out_stem(opts.combine_name or f"{os.path.splitext(first_name)[0]}_combined", opts)
+
+    if opts.no_convert:
+        out = f"{stem}.{first_ext}"
+        candidates = [out]
+    else:
+        out = f"{stem}.{video_ext(opts)}"
+        candidates = [f"{stem}.mov", f"{stem}.mp4", f"{stem}.wav"] + [f"{stem}_a{n}.wav" for n in range(1, 5)]
+
+    # Never overwrite one of the inputs.
+    for cand in candidates:
+        for f in files:
+            if os.path.exists(cand) and os.path.samefile(cand, f):
+                print(f"Error: the combined output '{cand}' would overwrite input file '{f}'. Pick a different name.",
+                      file=sys.stderr)
+                return 1
+
+    # Concatenation needs matching codec, resolution, frame rate and audio layout.
+    ref_sig = stream_signature(first)
+    for f in files:
+        if stream_signature(f) != ref_sig:
+            print(f"Error: '{f}' does not match the stream layout of '{first}' (codec, resolution, pixel format, "
+                  "frame rate, audio parameters, or number of audio tracks differ).", file=sys.stderr)
+            print("All clips must share the same settings to be combined without re-encoding each one first.",
+                  file=sys.stderr)
+            return 1
+
+    total_size = sum(get_file_size(f) for f in files)
+
+    logger.log(f"Combining {len(files)} files into '{out}' (in this order):")
+    for f in files:
+        logger.log(f"  - {f}")
+
+    if opts.no_convert:
+        return combine_copy_only(files, out, opts, logger)
+
+    if opts.resumable:
+        return combine_resumable(files, stem, total_size, opts, gpu, logger)
+
+    logger.log("Combining and converting to the target format in a single pass.")
+    with tempfile.TemporaryDirectory(prefix="tovinci-") as tmp:
+        list_file = Path(tmp) / "concat.txt"
+        write_concat_list(list_file, files)
+        try:
+            plan = build_plan(first, stem, opts, gpu, logger.log, str(list_file), total_size)
+        except ToolError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        status = encode(plan, opts, logger, first, use_temp=False)
+    if status == 0:
+        announce_outputs(plan, logger)
+    return status
+
+
+def combine_copy_only(files: list, out: str, opts: Options, logger: Logger) -> int:
+    if opts.resumable:
+        logger.log("--resumable has no effect with --no-convert (a stream copy is quick and not re-encoded).")
+    logger.log("--no-convert set. Combining with stream copy only, no DaVinci conversion. All audio tracks are kept as-is.")
+    with tempfile.TemporaryDirectory(prefix="tovinci-") as tmp:
+        list_file = Path(tmp) / "concat.txt"
+        write_concat_list(list_file, files)
+        plan = Plan([], ["-f", "concat", "-safe", "0", "-i", str(list_file)],
+                    [(["-map", "0:v?", "-map", "0:a?", "-c", "copy"], out)])
+        status = encode(plan, opts, logger, "combine", use_temp=False)
+    if status == 0:
+        logger.notify(f"Done! Combined file created: '{out}'")
+    return status
+
+
+def combine_resumable(files: list, stem: str, total_size: int, opts: Options,
+                      gpu: Gpu | None, logger: Logger) -> int:
+    """Encode each clip to its own part in the work directory, then join the parts
+    with a stream copy. A finished part is never encoded again."""
+    root = state_root(opts)
+    state = root / f"combine-{job_key(files, stem, opts)}"
+    if opts.restart and state.exists():
+        shutil.rmtree(state, ignore_errors=True)
+    state.mkdir(parents=True, exist_ok=True)
+    note_work_dir(root, logger)
+
+    count = len(files)
+    parts: list = []  # parts[k] = output paths of clip k, in plan order
+    try:
+        for idx, clip in enumerate(files):
+            part_stem = str(state / f"part_{idx:04d}")
+            marker = state / f"part_{idx:04d}.done.json"
+            plan = build_plan(clip, part_stem, opts, gpu, logger.log, size_override=total_size)
+            outs = [p for _, p in plan.outputs]
+
+            if marker.exists() and all(os.path.exists(p) for p in outs):
+                logger.notify(f"[{idx + 1}/{count}] Already encoded, skipping: '{clip}'")
+                parts.append(outs)
+                continue
+
+            logger.notify(f"[{idx + 1}/{count}] Encoding '{clip}'...")
+            status = encode(plan, opts, logger, clip, use_temp=True)
+            if status != 0:
+                print("Re-run the same command to resume from this clip.", file=sys.stderr)
+                return status
+            marker.write_text(json.dumps(outs))
+            parts.append(outs)
+
+        # Same output names as a normal combine, worked out without logging.
+        final_plan = build_plan(files[0], stem, opts, gpu, lambda _m: None, size_override=total_size)
+        finals = [p for _, p in final_plan.outputs]
+
+        logger.notify("All clips encoded. Joining parts (stream copy)...")
+        for j, final in enumerate(finals):
+            list_file = state / f"concat_{j}.txt"
+            write_concat_list(list_file, [part[j] for part in parts])
+            join = Plan([], ["-f", "concat", "-safe", "0", "-i", str(list_file)],
+                        [(["-map", "0", "-c", "copy"], final)])
+            status = encode(join, opts, logger, final, use_temp=True)
+            if status != 0:
+                print("The encoded parts were kept. Re-run the same command to retry the join.", file=sys.stderr)
+                return status
+    except ToolError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    announce_outputs(final_plan, logger)
+    if opts.keep_work:
+        logger.notify(f"Work files kept in '{state}'.")
+    else:
+        shutil.rmtree(state, ignore_errors=True)
+    return 0
+
+
+# -------------------------------------------------------------------- CLI ---
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
+def parse_bool(value: str) -> bool:
+    low = value.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    raise argparse.ArgumentTypeError(f"must be true or false (got '{value}')")
+
+
+def build_parser() -> Parser:
+    p = Parser(prog="tovinci", allow_abbrev=False,
+               formatter_class=argparse.RawDescriptionHelpFormatter,
+               description="Convert media into DaVinci Resolve (Linux) friendly formats.",
+               epilog=EXAMPLES)
+    p.add_argument("-V", "--version", action="version", version=f"%(prog)s {VERSION}",
+                   help="show the version and exit")
+    p.add_argument("-v", dest="verbose", action="count", default=0,
+                   help="-v: step log and brief ffmpeg progress; -vv: full live ffmpeg output")
+    p.add_argument("-t", dest="target_type", default="", metavar="TYPE",
+                   help=f"force an output type: {TYPE_CHOICES}")
+    p.add_argument("--bits", default=None, metavar="N", help="force PCM audio bit depth: 16, 24 or 32")
+    p.add_argument("--threaded", action="store_true", help="force multi-threaded encoding regardless of size")
+    p.add_argument("-j", "--jobs", type=int, default=1, metavar="N", help="process up to N files concurrently")
+    p.add_argument("--use-gpu", type=parse_bool, default=False, metavar="true|false",
+                   help="decode on GPU if a backend is available (use as -use-gpu=true)")
+    p.add_argument("-ca", "--combine-audio", action="store_true", help="mix all audio tracks into one stereo track")
+    p.add_argument("-sa", "--split-audio", action="store_true",
+                   help="video-only output plus one WAV per audio track")
+    p.add_argument("-c", "--combine", action="store_true",
+                   help="combine all inputs into one video first (use as: -c [NAME])")
+    p.add_argument("--combine-name", default="", help=argparse.SUPPRESS)
+    p.add_argument("--no-convert", action="store_true", help="with -c: only combine, skip DaVinci conversion")
+    p.add_argument("--keep-order", action="store_true",
+                   help="with -c: combine in exactly the order given (default: natural order, 1, 2, ... 10)")
+    p.add_argument("-r", "--resumable", action="store_true",
+                   help="make the run resumable: re-run the same command after an interruption")
+    p.add_argument("--restart", action="store_true", help="with -r: discard saved progress and start over")
+    p.add_argument("--keep-work", action="store_true", help="with -r: keep work files after a successful run")
+    p.add_argument("--work-dir", type=Path, default=None, metavar="DIR",
+                   help="with -r: where resume data lives (default ~/.cache/tovinci, never under /mnt/Data)")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="estimate the output size (per file, or combined with -c) from short samples "
+                        "without writing any output files")
+    p.add_argument("-o", "--output-dir", type=Path, default=None, metavar="DIR",
+                   help="write all output files into DIR (created if missing); default is the current directory")
+    p.add_argument("inputs", nargs="*", metavar="file_or_pattern")
+    return p
+
+
+def preprocess_argv(argv: list) -> list:
+    """Rewrite the options argparse cannot express: -c [NAME] and -use-gpu=VALUE."""
+    out: list = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            out.extend(argv[i:])
+            break
+        if arg in ("-c", "--combine"):
+            out.append("--combine")
+            if i + 1 < len(argv) and looks_like_name(argv[i + 1]):
+                out.append(f"--combine-name={argv[i + 1]}")
+                i += 1
+        elif arg.startswith("--combine="):
+            out += ["--combine", f"--combine-name={arg.split('=', 1)[1]}"]
+        elif arg.startswith("-use-gpu="):
+            out.append("--use-gpu=" + arg.split("=", 1)[1])
+        else:
+            out.append(arg)
+        i += 1
+    return out
+
+
+def parse_args(argv: list) -> tuple:
+    parser = build_parser()
+    if not argv:
+        parser.print_help()
+        sys.exit(1)
+    ns = parser.parse_intermixed_args(preprocess_argv(argv))
+
+    target = ns.target_type.lower()
+    quality = ""
+    bits = ns.bits
+    if target:
+        if target == "wav":
+            pass
+        elif target in ("wav-16", "wav-24", "wav-32"):
+            bits = target.split("-", 1)[1]
+            target = "wav"
+        elif target == "mp4":
+            pass
+        elif target == "mp4-small":
+            target = "mp4"
+            quality = "small"
+        elif target == "prores":
+            quality = "hq"
+        elif target.startswith("prores-") and target.split("-", 1)[1] in PRORES_PROFILES:
+            quality = target.split("-", 1)[1]
+            target = "prores"
+        else:
+            parser.error(f"unsupported -t type '{ns.target_type}' (supported: {TYPE_CHOICES}).")
+    if bits is not None and str(bits) not in ("16", "24", "32"):
+        parser.error(f"bit depth must be 16, 24 or 32 (got '{bits}').")
+    if target == "mp4" and bits is not None:
+        parser.error("--bits only applies to PCM audio, but mp4 output uses AAC audio.")
+    if ns.jobs < 1:
+        parser.error(f"-j/--jobs must be a positive integer (got '{ns.jobs}').")
+    if ns.no_convert and not ns.combine:
+        parser.error("--no-convert can only be used together with -c/--combine.")
+    if ns.no_convert and target in ("mp4", "prores"):
+        parser.error(f"-t {ns.target_type} cannot be used with --no-convert (the video would need to be re-encoded).")
+    if ns.no_convert and ns.combine_audio:
+        parser.error("-ca/--combine-audio cannot be used with --no-convert (mixing audio requires re-encoding it).")
+    if ns.no_convert and ns.split_audio:
+        parser.error("-sa/--split-audio cannot be used with --no-convert (splitting audio requires re-encoding it).")
+    if ns.combine_audio and ns.split_audio:
+        parser.error("-ca/--combine-audio and -sa/--split-audio contradict each other "
+                     "(mix into one vs. one file per track).")
+    if ns.no_convert and bits is not None:
+        parser.error("a forced bit depth cannot be used with --no-convert (audio is stream-copied untouched).")
+    if ns.keep_order and not ns.combine:
+        parser.error("--keep-order can only be used together with -c/--combine.")
+    if (ns.restart or ns.keep_work or ns.work_dir) and not ns.resumable:
+        parser.error("--restart, --keep-work and --work-dir require -r/--resumable.")
+    if not ns.inputs:
+        parser.print_usage(sys.stderr)
+        sys.exit(1)
+
+    combine_name = ns.combine_name
+    if combine_name and has_media_ext(combine_name):
+        combine_name = os.path.splitext(combine_name)[0]
+
+    output_dir = ns.output_dir.expanduser() if ns.output_dir is not None else None
+
+    opts = Options(verbose=ns.verbose, target_type=target, quality=quality,
+                   bits=str(bits) if bits is not None else None,
+                   threaded=ns.threaded, jobs=ns.jobs, gpu_requested=ns.use_gpu, combine=ns.combine,
+                   combine_name=combine_name, no_convert=ns.no_convert, combine_audio=ns.combine_audio,
+                   split_audio=ns.split_audio, resumable=ns.resumable, keep_order=ns.keep_order,
+                   restart=ns.restart,
+                   keep_work=ns.keep_work, work_dir=ns.work_dir, dry_run=ns.dry_run,
+                   output_dir=output_dir)
+    return opts, ns.inputs
+
+
+def resolve_files(patterns: list) -> list:
+    files: list = []
+    for arg in patterns:
+        if os.path.isfile(arg):
+            files.append(arg)
+        elif has_glob_chars(arg):
+            matches = sorted(glob.glob(arg))
+            if matches:
+                files.extend(m for m in matches if os.path.isfile(m))
+            else:
+                print(f"Warning: pattern '{arg}' matched no files - skipping.", file=sys.stderr)
+        else:
+            print(f"Warning: file '{arg}' not found - skipping.", file=sys.stderr)
+    return files
+
+
+def main(argv: list | None = None) -> int:
+    opts, patterns = parse_args(sys.argv[1:] if argv is None else argv)
+
+    files = resolve_files(patterns)
+    if not files:
+        print("Error: no valid input files found.", file=sys.stderr)
+        return 1
+    total = len(files)
+
+    if opts.combine:
+        if total < 2:
+            print(f"Error: -c/--combine needs at least 2 valid input files (found {total}).", file=sys.stderr)
+            return 1
+        opts.jobs = 1  # combining produces one output, so concurrency does not apply
+
+    gpu = None
+    if opts.gpu_requested and not opts.no_convert:
+        gpu = detect_gpu()
+        if gpu:
+            print(f"GPU-accelerated decode enabled (backend: {gpu.backend}). Encoding itself still runs "
+                  "on the CPU.", file=sys.stderr)
+        else:
+            print("Warning: -use-gpu=true requested, but no usable GPU decode backend was detected "
+                  "(checked cuda/vaapi/qsv). Falling back to CPU decoding.", file=sys.stderr)
+
+    log_path = setup_log_path()
+    rotate_log(log_path)
+    logger = Logger(log_path, opts.verbose)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        if not opts.dry_run:
+            prepare_output_dir(opts)  # a dry run writes nothing, so it never creates the directory
+
+        if opts.combine:
+            logger.log(f"{RUN_MARKER} {stamp} :: tovinci {VERSION} :: combine {total} files ===")
+            files = order_for_combine(files, opts, logger)
+            if opts.dry_run:
+                return run_dry_run(files, opts, gpu, logger, combine=True)
+            return run_combine(files, opts, gpu, logger)
+
+        if total == 1:
+            logger.log(f"{RUN_MARKER} {stamp} :: tovinci {VERSION} :: '{files[0]}' ===")
+        else:
+            logger.log(f"{RUN_MARKER} {stamp} :: tovinci {VERSION} :: {total} files (jobs={opts.jobs}) ===")
+
+        if opts.dry_run:
+            return run_dry_run(files, opts, gpu, logger, combine=False)
+
+        check_output_collisions(files, opts)
+
+        def job(f: str) -> int:
+            prefix = f"[{os.path.basename(f)}] " if opts.jobs > 1 else ""
+            try:
+                return process_file(f, opts, gpu, logger.child(prefix))
+            except ToolError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+
+        with ThreadPoolExecutor(max_workers=opts.jobs) as pool:
+            results = list(pool.map(job, files))
+
+        failed = [f for f, rc in zip(files, results) if rc != 0]
+        if total > 1:
+            logger.log(RULE)
+            if not failed:
+                logger.notify(f"Done! All {total} file(s) converted successfully.")
+            else:
+                logger.notify(f"Finished: {total - len(failed)}/{total} file(s) converted successfully.")
+                logger.notify("Failed to convert:")
+                for f in failed:
+                    logger.notify(f"  - {f}")
+                print(f"See {log_path} for details.", file=sys.stderr)
+        return 1 if failed else 0
+
+    except ToolError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        if opts.resumable:
+            print("Re-run the same command to resume.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
